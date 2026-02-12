@@ -264,3 +264,99 @@ The codebase is structured to be easy to extend. Some natural next steps:
 
 If you modify or extend the app, consider updating this README with new commands, environment variables, and screenshots so future readers can quickly understand how everything fits together.
 
+---
+
+### Problems I faced and how I solved them
+
+This section documents a few non‑obvious issues and how they were resolved. The goal is to save you time if you run into similar behavior.
+
+#### 1. Stuck in a login loop on Vercel
+
+**Symptom:** In production, after signing in with Google, the app immediately redirected back to the `/login` page instead of the dashboard.
+
+**Root cause:** The Supabase client in `middleware.ts` and `lib/supabase/server.ts` reads `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. On Vercel, these were either not set or did not match the Supabase project used locally, so `supabase.auth.getUser()` always returned `user: null` and the middleware treated every request as unauthenticated.
+
+**Fix:**
+
+1. In the Vercel project settings, configure:
+   - `NEXT_PUBLIC_SUPABASE_URL`
+   - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+   - `NEXT_PUBLIC_APP_URL`
+2. In the Supabase Auth settings, set:
+   - **Site URL** to the deployed Vercel URL, for example `https://your-app.vercel.app`.
+   - Ensure `https://your-app.vercel.app/auth/callback` is allowed as a redirect URL.
+3. Redeploy the app so middleware and server clients pick up the correct environment.
+
+After this, `supabase.auth.getUser()` in middleware started returning a valid user, and the redirect loop disappeared.
+
+#### 2. Open Graph images and CORS / upstream failures
+
+**Symptom:** Link preview images worked for some sites locally but broke intermittently or produced a lot of terminal noise such as:
+
+- `upstream image response failed for ... 404`
+- `... 403`
+
+**Root cause:** When using `next/image` to load arbitrary remote images, Next.js proxies those requests through its image optimizer. Many third‑party image hosts return 403/404 for automated requests or for certain referrers, leading to noisy logs and broken previews. Additionally, making metadata requests directly from the browser ran into CORS restrictions on some sites.
+
+**Fix:**
+
+1. Move all metadata fetching into a server route:
+
+   - Implemented `app/api/metadata/route.ts` that:
+     - Fetches HTML on the server.
+     - Parses Open Graph / Twitter tags and favicon.
+     - Returns a normalized JSON payload.
+
+2. Fetch previews from the client only against this internal API:
+
+   - `add-bookmark-dialog.tsx` and `bookmark-card.tsx` call `/api/metadata?url=...` instead of talking to third‑party domains directly from the browser.
+
+3. Stop using `next/image` for these arbitrary remote images:
+
+   - Replaced preview and favicon rendering with plain `<img>` tags.
+   - This avoids the Next.js image optimizer layer that was generating most of the upstream error logs.
+
+The result is a more predictable preview experience and far fewer noisy errors when sites respond with non‑200 status codes.
+
+#### 3. Realtime updates not appearing in other tabs
+
+**Symptom:** Adding or deleting bookmarks updated immediately in the current tab (thanks to optimistic client state) but did not appear or disappear in another tab until a full reload.
+
+**Root cause:** Supabase Realtime was not enabled for the `bookmarks` table, so the `useBookmarks` subscription received no events. The hook’s logic for handling `INSERT`, `UPDATE`, and `DELETE` events was correct, but no events were ever published.
+
+**Fix:**
+
+1. In Supabase, enable Realtime on the `bookmarks` table either via the GUI or SQL:
+
+   ```sql
+   ALTER PUBLICATION supabase_realtime ADD TABLE bookmarks;
+   ```
+
+2. Confirm that the RLS policies allow the authenticated user to receive changes for their own rows.
+
+Once Realtime was enabled, changes in one tab appeared in other open tabs without reloading.
+
+#### 4. Metadata not fetching reliably when pasting URLs
+
+**Symptom:** Pasting a URL into the “Add bookmark” modal sometimes failed to fetch metadata, especially when the user immediately tabbed away or when URLs contained special characters.
+
+**Root cause:** The initial implementation only fetched metadata when pressing a “Fetch” button and relied on `encodeURIComponent(url)` without normalizing or validating the URL first. Race conditions between state updates and fetch calls also led to inconsistent behavior.
+
+**Fix:**
+
+1. Normalize and validate URLs:
+
+   - If the user omits the scheme, the app prepends `https://`.
+   - Use the `URL` constructor to validate the structure and ensure special characters are handled correctly.
+
+2. Trigger metadata fetch automatically:
+
+   - On `onBlur` of the URL input (if metadata has not been fetched yet).
+   - Immediately on `onPaste`, using the pasted text directly so the fetch does not race against React state updates.
+
+3. Keep a small “Refetch” button for manual retries.
+
+This made metadata loading feel much more automatic and robust, particularly for non‑trivial URLs.
+
+
